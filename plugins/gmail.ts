@@ -404,6 +404,7 @@ class Gmail extends Context.Service<
 
 const ApproveButton = ChatInteraction.button("gmail-approve-v1", {
   label: "Approve & send",
+  style: "primary",
   value: Schema.String,
 })
 
