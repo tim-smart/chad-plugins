@@ -7,12 +7,15 @@ import {
 } from "effect/http"
 
 type Api = "gmail" | "calendar"
+
 export class GoogleReadError extends Schema.TaggedError<GoogleReadError>()(
   "GoogleReadError",
   {
     message: Schema.String,
+    uncertain: Schema.optionalKey(Schema.Boolean),
   },
 ) {}
+
 const error = (message: string) => new GoogleReadError({ message })
 const networkError = () =>
   error("Google request failed, timed out or returned invalid data.")
@@ -26,19 +29,23 @@ const Token = Schema.Struct({
   expires_in: Schema.optional(Schema.Finite),
   scope: Schema.optional(Schema.String),
 })
+
 const parseJson = Schema.decodeUnknownEffect(
   Schema.fromJsonString(Schema.Unknown),
 )
+
 const readJson = Effect.fnUntraced(function* (
-  r: HttpClientResponse.HttpClientResponse,
+  response: HttpClientResponse.HttpClientResponse,
   cap: number,
 ) {
   const tooLarge = () => error("Google response exceeded the safe size limit.")
-  if (Number(r.headers["content-length"]) > cap) return yield* tooLarge()
+  if (Number(response.headers["content-length"]) > cap) {
+    return yield* tooLarge()
+  }
   const decoder = new TextDecoder()
-  let bytes = 0,
-    text = ""
-  yield* r.stream.pipe(
+  let bytes = 0
+  let text = ""
+  yield* response.stream.pipe(
     Stream.mapError(networkError),
     Stream.runForEach((chunk) => {
       bytes += chunk.byteLength
@@ -53,10 +60,14 @@ const readJson = Effect.fnUntraced(function* (
 })
 
 function validPath(api: Api, path: string) {
-  if (api === "gmail")
-    return /^(?:labels|messages|(?:messages|threads)\/[A-Za-z0-9_-]{1,128})$/.test(
-      path,
+  if (api === "gmail") {
+    return (
+      path === "settings/sendAs" ||
+      /^(?:labels|messages|(?:messages|threads)\/[A-Za-z0-9_-]{1,128})$/.test(
+        path,
+      )
     )
+  }
   if (path === "users/me/calendarList") return true
   const [prefix, id, suffix, ...rest] = path.split("/")
   if (
@@ -65,8 +76,9 @@ function validPath(api: Api, path: string) {
     id.length > 9216 ||
     suffix !== "events" ||
     rest.length
-  )
+  ) {
     return false
+  }
   try {
     const raw = decodeURIComponent(id)
     return (
@@ -80,13 +92,23 @@ function validPath(api: Api, path: string) {
   }
 }
 
+const gmailBase = "https://gmail.googleapis.com/gmail/v1/users/me/"
 const calendarBase = "https://www.googleapis.com/calendar/v3/"
 
 const makeTransport = Effect.fnUntraced(function* (
-  permission: "gmail.readonly" | "calendar.readonly" | "calendar.events",
-  refreshKey = permission === "calendar.events" ? "writeRefreshToken" : "refreshToken",
+  permission:
+    | "gmail.compose"
+    | "gmail.readonly"
+    | "calendar.readonly"
+    | "calendar.events",
+  refreshKey = permission === "calendar.events"
+    ? "writeRefreshToken"
+    : permission === "gmail.compose"
+      ? "composeRefreshToken"
+      : "refreshToken",
 ) {
-  const write = permission === "calendar.events"
+  const write =
+    permission === "calendar.events" || permission === "gmail.compose"
   const scope = "https://www.googleapis.com/auth/" + permission
   const setup =
     "Owner: authorize offline access with " +
@@ -98,6 +120,7 @@ const makeTransport = Effect.fnUntraced(function* (
   const clientSecret = yield* setting("clientSecret")
   const refreshToken = yield* setting(refreshKey)
   const client = HttpClient.withScope(yield* HttpClient.HttpClient)
+
   // Chad's Undici dispatcher returns 3xx directly; disable Fetch's own redirects too.
   const execute = (req: HttpClientRequest.HttpClientRequest) =>
     client.execute(req).pipe(
@@ -105,6 +128,7 @@ const makeTransport = Effect.fnUntraced(function* (
       Effect.provideService(HttpClient.TracerDisabledWhen, () => true),
       Effect.mapError(networkError),
     )
+
   const refresh = Effect.fnUntraced(
     function* () {
       const form = {
@@ -114,26 +138,29 @@ const makeTransport = Effect.fnUntraced(function* (
         grant_type: "refresh_token",
         scope,
       }
-      if (!form.client_id || !form.client_secret || !form.refresh_token)
+      if (!form.client_id || !form.client_secret || !form.refresh_token) {
         return yield* error(setup)
-      const r = yield* execute(
+      }
+      const response = yield* execute(
         HttpClientRequest.post("https://oauth2.googleapis.com/token").pipe(
           HttpClientRequest.bodyUrlParams(form),
         ),
       )
-      if (r.status < 200 || r.status >= 300)
+      if (response.status < 200 || response.status >= 300) {
         return yield* error(
-          "OAuth refresh failed (HTTP " + r.status + "). " + setup,
+          "OAuth refresh failed (HTTP " + response.status + "). " + setup,
         )
+      }
       const token = yield* Schema.decodeUnknownEffect(Token)(
-        yield* readJson(r, 32768),
+        yield* readJson(response, 32768),
       ).pipe(
         Effect.mapError(() =>
           error("Google returned no usable access token. " + setup),
         ),
       )
-      if ((write || token.scope !== undefined) && token.scope !== scope)
+      if ((write || token.scope !== undefined) && token.scope !== scope) {
         return yield* error("Unexpected authorization scope. " + setup)
+      }
       return {
         value: token.access_token,
         ttl: Math.max(0, Math.min(token.expires_in ?? 0, 3600) - 60) * 1000,
@@ -146,7 +173,6 @@ const makeTransport = Effect.fnUntraced(function* (
     }),
   )
 
-  // Cache coordinates waiters, cancels an unobserved lookup, and expires entries using Clock.
   const tokens = yield* Cache.makeWith((_key: string) => refresh(), {
     capacity: 1,
     timeToLive: (exit) => (Exit.isSuccess(exit) ? exit.value.ttl : 0),
@@ -154,34 +180,36 @@ const makeTransport = Effect.fnUntraced(function* (
   const accessToken = Cache.get(tokens, permission)
   const invalidate = (token: Effect.Success<typeof accessToken>) =>
     Cache.invalidateWhen(tokens, permission, (current) => current === token)
+
   return { execute, accessToken, invalidate }
 })
 
-export const makeGoogleRead = Effect.fnUntraced(function* (api: Api, refreshKey: "refreshToken" | "workRefreshToken" = "refreshToken") {
+export const makeGoogleRead = Effect.fnUntraced(function* (api: Api) {
   const gmail = api === "gmail"
   const name = gmail ? "Gmail" : "Calendar"
-  const base = gmail
-    ? "https://gmail.googleapis.com/gmail/v1/users/me/"
-    : calendarBase
+  const base = gmail ? gmailBase : calendarBase
   const { execute, accessToken, invalidate } = yield* makeTransport(
-    gmail ? "gmail.readonly" : "calendar.readonly", refreshKey,
+    gmail ? "gmail.readonly" : "calendar.readonly",
   )
+
   const read = Effect.fnUntraced(function* (
     req: HttpClientRequest.HttpClientRequest,
   ) {
-    const r = yield* execute(req)
+    const response = yield* execute(req)
     return {
-      status: r.status,
+      status: response.status,
       body:
-        r.status >= 200 && r.status < 300
-          ? yield* readJson(r, gmail ? 8 * 1024 * 1024 : 512 * 1024)
+        response.status >= 200 && response.status < 300
+          ? yield* readJson(response, gmail ? 8 * 1024 * 1024 : 512 * 1024)
           : undefined,
     }
   }, Effect.scoped)
+
   const get = Effect.fnUntraced(
     function* (path: string, params: URLSearchParams) {
-      if (!validPath(api, path))
+      if (!validPath(api, path)) {
         return yield* error("Invalid Google read path.")
+      }
       const req = HttpClientRequest.get(base + path + "?" + params.toString())
       for (let attempt = 0; ; attempt++) {
         const token = yield* accessToken
@@ -213,6 +241,7 @@ export const makeGoogleRead = Effect.fnUntraced(function* (api: Api, refreshKey:
       orElse: () => Effect.fail(networkError()),
     }),
   )
+
   return { get }
 })
 
@@ -237,6 +266,7 @@ const ambiguous = () =>
 export const makeCalendarWrite = Effect.fnUntraced(function* () {
   const { execute, accessToken, invalidate } =
     yield* makeTransport("calendar.events")
+
   const mutate = Effect.fnUntraced(function* (
     method: "POST" | "PATCH" | "DELETE",
     calendarId: string,
@@ -247,29 +277,38 @@ export const makeCalendarWrite = Effect.fnUntraced(function* () {
       (method !== "POST" && method !== "PATCH" && method !== "DELETE") ||
       (method === "POST") !== (eventId === undefined) ||
       (method === "DELETE" && body !== undefined)
-    )
+    ) {
       return yield* error("Invalid Calendar write request.")
+    }
     const path =
       "calendars/" +
       (yield* encodeId(calendarId)) +
       "/events" +
       (eventId === undefined ? "" : "/" + (yield* encodeId(eventId)))
     let req = HttpClientRequest.make(method)(calendarBase + path)
-    if (body !== undefined)
+    if (body !== undefined) {
       req = yield* HttpClientRequest.bodyJson(req, body).pipe(
         Effect.mapError(() => error("Invalid Calendar event body.")),
       )
+    }
     const token = yield* accessToken
     return yield* Effect.gen(function* () {
-      const r = yield* execute(
+      const response = yield* execute(
         HttpClientRequest.bearerToken(req, token.value),
       ).pipe(Effect.mapError(ambiguous))
-      if (r.status === 204) return undefined
-      if (r.status >= 200 && r.status < 300)
-        return yield* readJson(r, 512 * 1024).pipe(Effect.mapError(ambiguous))
-      if (r.status === 401) yield* invalidate(token)
-      if (r.status === 408 || r.status >= 500) return yield* ambiguous()
-      return yield* error("Calendar write failed (HTTP " + r.status + ").")
+      if (response.status === 204) return undefined
+      if (response.status >= 200 && response.status < 300) {
+        return yield* readJson(response, 512 * 1024).pipe(
+          Effect.mapError(ambiguous),
+        )
+      }
+      if (response.status === 401) yield* invalidate(token)
+      if (response.status === 408 || response.status >= 500) {
+        return yield* ambiguous()
+      }
+      return yield* error(
+        "Calendar write failed (HTTP " + response.status + ").",
+      )
     }).pipe(
       Effect.scoped,
       Effect.timeoutOrElse({
@@ -278,5 +317,114 @@ export const makeCalendarWrite = Effect.fnUntraced(function* () {
       }),
     )
   })
+
   return { mutate }
+})
+
+const GmailIdResponse = Schema.Struct({
+  id: Schema.String.check(Schema.isPattern(/^[A-Za-z0-9_-]{1,128}$/)),
+})
+
+const SendAsResponse = Schema.Struct({
+  sendAs: Schema.Array(
+    Schema.Struct({
+      sendAsEmail: Schema.String,
+      isPrimary: Schema.optionalKey(Schema.Boolean),
+      verificationStatus: Schema.optionalKey(Schema.String),
+    }),
+  ),
+})
+
+const verifySendAs = Effect.fnUntraced(function* (
+  reader: Effect.Success<ReturnType<typeof makeGoogleRead>>,
+  fromAddress: string,
+) {
+  const data = yield* reader.get(
+    "settings/sendAs",
+    new URLSearchParams({
+      fields: "sendAs(sendAsEmail,isPrimary,verificationStatus)",
+    }),
+  )
+  const { sendAs } = yield* Schema.decodeUnknownEffect(SendAsResponse)(
+    data,
+  ).pipe(Effect.mapError(networkError))
+  const primary = sendAs.find((alias) => alias.isPrimary)
+  const verified = sendAs.some(
+    (alias) =>
+      alias.sendAsEmail.toLowerCase() === fromAddress.toLowerCase() &&
+      (alias.isPrimary || alias.verificationStatus === "accepted"),
+  )
+  if (
+    !primary ||
+    !/^[A-Za-z0-9._+%-]+@[A-Za-z0-9.-]+$/.test(primary.sendAsEmail) ||
+    !verified
+  ) {
+    return yield* error(
+      `Gmail write blocked: verify ${fromAddress} in Send mail as settings.`,
+    )
+  }
+  return primary.sendAsEmail
+})
+
+export const makeGmailCompose = Effect.fnUntraced(function* (options?: {
+  readonly reader?: Effect.Success<ReturnType<typeof makeGoogleRead>>
+  readonly from?: string
+}) {
+  const { execute, accessToken, invalidate } =
+    yield* makeTransport("gmail.compose")
+  const unknownOutcome = () =>
+    new GoogleReadError({
+      uncertain: true,
+      message:
+        "Gmail write outcome unknown. Check Drafts and Sent before trying again.",
+    })
+
+  const write = Effect.fnUntraced(function* (
+    kind: "draft" | "send",
+    raw: string,
+  ) {
+    const token = yield* accessToken
+    const user =
+      options?.from && options.reader
+        ? encodeURIComponent(yield* verifySendAs(options.reader, options.from))
+        : "me"
+    const endpoint = kind === "draft" ? "drafts" : "messages/send"
+    const payload = kind === "draft" ? { message: { raw } } : { raw }
+    const req = yield* HttpClientRequest.post(
+      `https://gmail.googleapis.com/gmail/v1/users/${user}/${endpoint}?fields=id`,
+    ).pipe(
+      HttpClientRequest.bodyJson(payload),
+      Effect.mapError(() => error("Invalid Gmail write body.")),
+    )
+
+    return yield* Effect.gen(function* () {
+      const response = yield* execute(
+        HttpClientRequest.bearerToken(req, token.value),
+      ).pipe(Effect.mapError(unknownOutcome))
+      if (response.status === 401) yield* invalidate(token)
+      if (response.status === 408 || response.status >= 500) {
+        return yield* unknownOutcome()
+      }
+      if (response.status < 200 || response.status >= 300) {
+        return yield* error(
+          `Gmail write failed (HTTP ${response.status}). Check the mailbox and compose authorization.`,
+        )
+      }
+      return yield* readJson(response, 4096).pipe(
+        Effect.flatMap(Schema.decodeUnknownEffect(GmailIdResponse)),
+        Effect.mapError(unknownOutcome),
+      )
+    }).pipe(
+      Effect.scoped,
+      Effect.timeoutOrElse({
+        duration: "15 seconds",
+        orElse: () => Effect.fail(unknownOutcome()),
+      }),
+    )
+  })
+
+  return {
+    createDraft: (raw: string) => write("draft", raw),
+    sendMessage: (raw: string) => write("send", raw),
+  }
 })
